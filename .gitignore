@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+.Python
+*.egg-info/
+
+# Datasets / checkpoints / experiment outputs
+*.pt
+*.npz
+*.log
+*.csv
+dataset.npz
+sweep/
+sweep_*/
+output_eval/
+wandb/
+
+# Generated plots
+*.png
+*.mp4
+expert_rollout.*
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+*.swp
