@@ -12,59 +12,35 @@ from env import PickAndPlaceEnv
 from train_bc import BCMLP, BCWithDecoder
 
 
-# Feedback linearization: we control a virtual point a distance B_OFFSET ahead of the
-# wheel center along the heading. Its jacobian w.r.t. (v, ω) is invertible for B>0, so
-# any virtual planar acceleration (u_x, u_y) maps to a unique (v_des, ω_des). The wheel
-# center then trails the offset point by B along the heading — keep B small relative to
-# tolerances (PICK_RADIUS=0.06, DROP_RADIUS=0.025) but large enough that ω = lateral/B
-# doesn't saturate the yaw actuator on path noise.
-B_OFFSET = 0.04
-
-# P-gain on offset-point position error. With DT=0.05 the closed-loop point dynamics
-# are ẋ_b = u_x = ẋ_ref + K_P·(x_ref − x_b), so K_P sets the convergence rate. Too high
-# → v_des spikes saturate K_V·(v_des−v) thrust; too low → lag behind the BC path.
-K_P = 25.0
-
-# Thrust loop: thrust = K_V·(v_des − v). The FL law produces v_des directly, not thrust,
-# so this is the inner first-order velocity tracker on top.
-K_V = 2.0
+# Operational-space PD on the EE for the planar arm: pretend the EE is a virtual
+# point-mass, apply Cartesian PD with a velocity feedforward from the path's natural
+# spacing, then convert to joint torques via the transpose Jacobian. Gains tuned
+# against expert-generated paths — stiffer than the static-target expert needs.
+K_P = 150.0  # position P-gain
+K_D = 20.0   # Cartesian velocity D-gain
+K_Q = 0.2    # joint-space damping (kept small so feedforward isn't fought)
 
 
-def track(env: PickAndPlaceEnv, path: np.ndarray, chunk_step: int) -> np.ndarray:
-    """Feedback linearization of the unicycle on a time-indexed BC path.
+def track(env, path: np.ndarray, chunk_step: int) -> np.ndarray:
+    """Track a time-indexed BC EE-path on the planar arm.
 
-    Define x_b = x + B·cosθ, y_b = y + B·sinθ. Then
-        [ẋ_b; ẏ_b] = T(θ)·[v; ω],  T(θ) = [[cosθ, −B·sinθ], [sinθ, B·cosθ]]
-    with det T = B, so the inverse exists for any θ:
-        v = cosθ·u_x + sinθ·u_y,   ω = (−sinθ·u_x + cosθ·u_y) / B.
-    Textbook FL drives x_b to the reference, which leaves the wheel center trailing by
-    B along the heading — a 4 cm steady-state offset misses DROP_RADIUS=2.5 cm. We use
-    the *wheel* error in u instead: substituting (x_ref − x) for (x_ref − x_b) makes
-    v_des = v_ref·ĥ + K_P·err·ĥ (heading-projected PD on position) and ω = lateral/B.
-    The wheel converges to path[k]; B only sets the relative weight of yaw to thrust.
-    Path is indexed as a trajectory in time (path[k] = intended position k steps into
-    the chunk); neighboring spacing is ẋ_ref — natural slow-down where expert dwelled."""
-    agent = env.agent_pos.detach().cpu().numpy()
-    cos_y, sin_y = math.cos(env.agent_yaw), math.sin(env.agent_yaw)
-    speed = float(env.agent_speed)
+    F_des = K_P·(p_ref − ee) + K_D·(v_ref − ee_vel),  τ = Jᵀ·F_des − K_Q·qd.
+    p_ref = path[k]; v_ref is the path's forward-difference (its natural pace).
+    Joint-space damping stabilizes the redundant null-space."""
+    ee = np.asarray(env.ee, dtype=np.float32)
+    J = env.jacobian(env.q)
+    ee_vel = J @ env.qd
 
     k = min(chunk_step, len(path) - 1)
-    x_ref, y_ref = float(path[k, 0]), float(path[k, 1])
+    p_ref = np.asarray(path[k], dtype=np.float32)
     if k + 1 < len(path):
-        dx_ref = (path[k + 1, 0] - path[k, 0]) / env.DT
-        dy_ref = (path[k + 1, 1] - path[k, 1]) / env.DT
+        v_ref = (np.asarray(path[k + 1], dtype=np.float32) - p_ref) / env.DT
     else:
-        dx_ref = dy_ref = 0.0
+        v_ref = np.zeros(2, dtype=np.float32)
 
-    u_x = dx_ref + K_P * (x_ref - agent[0])
-    u_y = dy_ref + K_P * (y_ref - agent[1])
-
-    v_des = cos_y * u_x + sin_y * u_y
-    omega_des = (-sin_y * u_x + cos_y * u_y) / B_OFFSET
-
-    thrust_action = float(np.clip(K_V * (v_des - speed), -1.0, 1.0))
-    yaw_action = float(np.clip(omega_des / env.MAX_YAW_RATE, -1.0, 1.0))
-    return np.array([thrust_action, yaw_action, 0.0], dtype=np.float32)
+    F_des = K_P * (p_ref - ee) + K_D * (v_ref - ee_vel)
+    tau = J.T @ F_des - K_Q * env.qd
+    return np.clip(tau / env.MAX_TORQUE, -1.0, 1.0).astype(np.float32)
 
 
 def _build_decoder(vae_cfg: dict) -> nn.Module:
@@ -227,7 +203,10 @@ def main():
                         "([--seed, --seed+episodes-1] there; defaults to [0, 99]) and from "
                         "env_eval's in-loop seeds ([100000, ...]). Default 10000 is safe "
                         "unless you collect >10000 episodes.")
-    p.add_argument("--execute", type=int, default=8, help="Steps to execute before re-planning.")
+    p.add_argument("--execute", type=int, default=None,
+                   help="Steps to execute from each predicted chunk before re-planning. "
+                        "Defaults to max(8, window * 3 // 4) — keeps short chunks responsive "
+                        "while letting long chunks (window=32) actually be used.")
     p.add_argument("--video", action="store_true",
                    help="Save videos of the first --num_video episodes into --output_dir.")
     p.add_argument("--num_video", type=int, default=1, help="Number of videos to save when --video is set.")
@@ -240,7 +219,9 @@ def main():
 
     model, cfg, norm = load_bc(args.ckpt, args.device)
     mode = cfg.get("mode", "delta")
-    print(f"Loaded BC ({mode}): history={cfg['history']} window={cfg['window']} hidden={cfg['hidden']}")
+    if args.execute is None:
+        args.execute = max(8, cfg["window"] * 3 // 4)
+    print(f"Loaded BC ({mode}): history={cfg['history']} window={cfg['window']} hidden={cfg['hidden']} execute={args.execute}")
     print(f"Eval seeds: [{args.seed}, {args.seed + args.episodes - 1}] "
           f"(collect_data default range is [0, 99]; train-loop eval uses [100000, ...]).")
 

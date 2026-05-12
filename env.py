@@ -11,62 +11,62 @@ import gymnasium as gym
 from gymnasium import spaces
 
 
-class PickAndPlaceEnv(gym.Env):
-    """
-    2D point-mass pick-and-place with unicycle motion.
+class PlanarArmEnv(gym.Env):
+    """Planar N-link revolute arm, no gravity, pick-and-place.
 
-    Action (Box[3]):  [thrust in [-1, 1], yaw_rate in [-1, 1], gripper in [0, 1]].
-        thrust   - forward force along the agent heading
-        yaw_rate - turning rate
-        gripper  - >0.5 means closed; closing within `PICK_RADIUS` of the object
-                   attaches it. Opening releases the object in place.
+    Configurable via constructor arg `n_joints` (default 3). All links share
+    length `1.0 / n_joints` so total reach is 1.0; the base sits at the arena
+    center so the workspace covers all of [0, 1]².
 
-    Observation (Box[9]):
-        [agent_x, agent_y, cos(yaw), sin(yaw),
+    Action (Box[N]):  per-joint torque in [-1, 1], scaled by MAX_TORQUE.
+    Observation (Box[2N + 9]):
+        [ee_x, ee_y, cos(theta_N), sin(theta_N),
+         q_1, ..., q_N, qd_1, ..., qd_N,
          object_x, object_y, goal_x, goal_y, attached]
+    (theta_i is the world-frame orientation of link i = cumsum(q)[i-1].)
 
-    Termination: object stays within `DROP_RADIUS` of the goal for
-    `GOAL_DWELL_STEPS` consecutive steps.
+    Auto-gripper: closes whenever the EE is within PICK_RADIUS of the object.
+    Termination: object stays within DROP_RADIUS of the goal for
+    GOAL_DWELL_STEPS consecutive steps.
     """
 
     metadata = {"render_modes": ["rgb_array"], "render_fps": 20}
 
-    # --- hard-coded configuration ---
     DT = 0.05
     IMAGE_SIZE = 256
-    MASS = 1.0
-    OBJECT_MASS = 0.0
-    LIN_DAMPING = 0.99
-    MAX_THRUST = 1.0
-    MAX_YAW_RATE = 5.0
-    # Nonholonomic constraints: no reverse (thrust ≥ 0) and a minimum turning radius
-    # |ω| ≤ |v| / R_MIN. At v=0 the agent cannot turn; the path manifold becomes
-    # Dubins-like, so sloppy raw-Δ predictions with sharp kinks become untrackable.
-    R_MIN = 0.10
-    MAX_EPISODE_STEPS = 400
+    MAX_TORQUE = 1.0
+    JOINT_DAMPING = 0.5
+    JOINT_INERTIA = 1.0
+    BASE_POS = (0.5, 0.5)
 
-    AGENT_RADIUS = 0.025
-    OBJECT_RADIUS = 0.04
-    GOAL_RADIUS = 0.06
-    GOAL_OUTLINE = 0.03
     PICK_RADIUS = 0.06
     DROP_RADIUS = 0.025
     GOAL_DWELL_STEPS = 10
+    MAX_EPISODE_STEPS = 400
+
+    OBJECT_RADIUS = 0.04
+    GOAL_RADIUS = 0.06
+    GOAL_OUTLINE = 0.03
+    JOINT_RADIUS = 0.015
+    EE_RADIUS = 0.02
+    LINK_WIDTH = 0.012
     TRAIL_LEN = 5
 
     BG_COLOR = (245, 245, 245)
-    AGENT_COLOR = (220, 30, 30)
-    YAW_COLOR = (0, 0, 0)            # black
-    GRIP_DOT_COLOR = (255, 255, 255)
+    ARM_COLOR = (220, 30, 30)
+    JOINT_COLOR = (40, 40, 40)
     OBJECT_COLOR = (30, 60, 220)
     GOAL_COLOR = (30, 230, 60)
 
-    def __init__(self):
+    def __init__(self, n_joints: int = 3):
         super().__init__()
         self.render_mode = "rgb_array"
         self.dtype = torch.float32
+        self.N = int(n_joints)
+        self.link_length = 1.0 / self.N
+        self.base_pos = np.array(self.BASE_POS, dtype=np.float32)
 
-        # Convenience public mirrors of constants used by callers.
+        # Convenience mirrors used by callers/tools.
         self.dt = self.DT
         self.H = self.IMAGE_SIZE
         self.W = self.IMAGE_SIZE
@@ -76,9 +76,8 @@ class PickAndPlaceEnv(gym.Env):
         self.goal_dwell_steps = self.GOAL_DWELL_STEPS
 
         self._bg = torch.tensor(self.BG_COLOR, dtype=torch.float32)
-        self._agent_c = torch.tensor(self.AGENT_COLOR, dtype=torch.float32)
-        self._yaw_c = torch.tensor(self.YAW_COLOR, dtype=torch.float32)
-        self._grip_c = torch.tensor(self.GRIP_DOT_COLOR, dtype=torch.float32)
+        self._arm_c = torch.tensor(self.ARM_COLOR, dtype=torch.float32)
+        self._joint_c = torch.tensor(self.JOINT_COLOR, dtype=torch.float32)
         self._obj_c = torch.tensor(self.OBJECT_COLOR, dtype=torch.float32)
         self._goal_c = torch.tensor(self.GOAL_COLOR, dtype=torch.float32)
 
@@ -87,47 +86,66 @@ class PickAndPlaceEnv(gym.Env):
         self.grid_y, self.grid_x = torch.meshgrid(ys, xs, indexing="ij")
 
         self.action_space = spaces.Box(
-            low=np.array([-1.0, -1.0, 0.0], dtype=np.float32),
-            high=np.array([1.0, 1.0, 1.0], dtype=np.float32),
+            low=-1.0 * np.ones(self.N, dtype=np.float32),
+            high=1.0 * np.ones(self.N, dtype=np.float32),
             dtype=np.float32,
         )
-        obs_low = np.array(
-            [0.0, 0.0, -1.0, -1.0, 0.0, 0.0, 0.0, 0.0, 0.0], dtype=np.float32
+        obs_dim = 2 * self.N + 9
+        self.observation_space = spaces.Box(
+            low=-np.inf * np.ones(obs_dim, dtype=np.float32),
+            high=np.inf * np.ones(obs_dim, dtype=np.float32),
+            dtype=np.float32,
         )
-        obs_high = np.array(
-            [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0], dtype=np.float32
-        )
-        self.observation_space = spaces.Box(low=obs_low, high=obs_high, dtype=np.float32)
 
         # State (filled in by reset).
-        self.agent_pos = None
-        self.agent_yaw = None
-        self.agent_speed = None
+        self.q = None
+        self.qd = None
+        self.ee = None
         self.object_pos = None
         self.goal_pos = None
         self.attached = False
-        self.gripper_closed = False
         self.dwell_counter = 0
         self.delivered = False
         self.steps = 0
 
-        # Trail of past agent positions (oldest -> newest), excluding the current pose.
+        # Trail of past EE positions (oldest -> newest), excluding the current pose.
         self._trail: deque = deque(maxlen=self.TRAIL_LEN)
 
-        # Recording: flip env._record = True before reset() to capture frames.
+        # Recording / debug-overlay machinery, kept compatible with the old env's API.
         self._record = False
         self._frames: list[torch.Tensor] = []
-
-        # Optional debug overlay: future-trajectory dots + arrows. Set per-step by the
-        # caller, persists until reassigned/None. Accepts (N, 2) of (x, y) positions —
-        # arrows are inferred from the vector to the next point — or (N, 3) of
-        # (x, y, yaw) for explicit headings.
         self.planned_path: Optional[np.ndarray] = None
-
-        # When True, the gripper action is ignored: the env closes the gripper
-        # automatically whenever the agent is within PICK_RADIUS of the object
-        # (and stays closed while attached).
         self.automatic_gripper = True
+
+    # ---- kinematics ----
+    def fk(self, q: np.ndarray) -> np.ndarray:
+        """Forward kinematics: joint angles -> EE position."""
+        thetas = np.cumsum(q)
+        x = self.base_pos[0] + self.link_length * float(np.sum(np.cos(thetas)))
+        y = self.base_pos[1] + self.link_length * float(np.sum(np.sin(thetas)))
+        return np.array([x, y], dtype=np.float32)
+
+    def joint_positions(self, q: np.ndarray) -> np.ndarray:
+        """Return positions of base + all joint pivots + EE, shape (N+1, 2)."""
+        thetas = np.cumsum(q)
+        out = np.zeros((self.N + 1, 2), dtype=np.float32)
+        out[0] = self.base_pos
+        for i in range(self.N):
+            out[i + 1, 0] = out[i, 0] + self.link_length * np.cos(thetas[i])
+            out[i + 1, 1] = out[i, 1] + self.link_length * np.sin(thetas[i])
+        return out
+
+    def jacobian(self, q: np.ndarray) -> np.ndarray:
+        """∂(ee_x, ee_y) / ∂q, shape (2, N). Standard planar-arm Jacobian."""
+        thetas = np.cumsum(q)
+        # ee = sum_i L * (cos θ_i, sin θ_i). θ_i depends on q_1..q_i, so:
+        # ∂ee_x/∂q_j = sum_{i ≥ j} -L sin θ_i,   ∂ee_y/∂q_j = sum_{i ≥ j} L cos θ_i.
+        sin_t = self.link_length * np.sin(thetas)
+        cos_t = self.link_length * np.cos(thetas)
+        # cumulative sums from the right.
+        rev_sin = np.cumsum(sin_t[::-1])[::-1]
+        rev_cos = np.cumsum(cos_t[::-1])[::-1]
+        return np.stack([-rev_sin, rev_cos], axis=0).astype(np.float32)
 
     # ---- gymnasium API ----
     def reset(self, *, seed: Optional[int] = None, options: Optional[dict] = None):
@@ -136,19 +154,22 @@ class PickAndPlaceEnv(gym.Env):
         def r2():
             return self.np_random.uniform(0.0, 1.0, size=2).astype(np.float32)
 
-        ap = r2()
+        # Random initial joint config; random object/goal in [0,1]², rejection-sampled
+        # to be non-overlapping with each other and with the initial EE position.
+        self.q = self.np_random.uniform(-np.pi, np.pi, size=self.N).astype(np.float32)
+        self.qd = np.zeros(self.N, dtype=np.float32)
+        self.ee = self.fk(self.q)
+
         op = r2()
-        while np.linalg.norm(ap - op) <= self.PICK_RADIUS:
+        while np.linalg.norm(op - self.ee) <= self.PICK_RADIUS:
             op = r2()
         gp = r2()
+        while np.linalg.norm(op - gp) <= 2.0 * (self.OBJECT_RADIUS + self.GOAL_RADIUS):
+            gp = r2()
 
-        self.agent_pos = torch.tensor(ap, dtype=self.dtype)
-        self.object_pos = torch.tensor(op, dtype=self.dtype)
-        self.goal_pos = torch.tensor(gp, dtype=self.dtype)
-        self.agent_yaw = float(self.np_random.uniform(-np.pi, np.pi))
-        self.agent_speed = 0.0
+        self.object_pos = torch.from_numpy(op).float()
+        self.goal_pos = torch.from_numpy(gp).float()
         self.attached = False
-        self.gripper_closed = False
         self.dwell_counter = 0
         self.delivered = False
         self.steps = 0
@@ -163,61 +184,27 @@ class PickAndPlaceEnv(gym.Env):
 
     def step(self, action):
         a = np.asarray(action, dtype=np.float32).reshape(-1)
-        # Thrust is a longitudinal force: negative = active brake. The "no reverse"
-        # constraint is kinematic — agent_speed gets clamped at 0 after integration,
-        # so the agent can decelerate quickly but cannot end up moving backward.
-        thrust = float(np.clip(a[0], -1.0, 1.0)) * self.MAX_THRUST
-        yaw_rate = float(np.clip(a[1], -1.0, 1.0)) * self.MAX_YAW_RATE
-        # Min-turning-radius cap: |ω| ≤ |v| / R_MIN (cannot spin in place at v=0).
-        omega_cap = abs(self.agent_speed) / self.R_MIN
-        yaw_rate = float(np.clip(yaw_rate, -omega_cap, omega_cap))
-        if self.automatic_gripper:
-            if self.attached:
-                grip_cmd = True
-            else:
-                d_obj = float(torch.linalg.vector_norm(self.agent_pos - self.object_pos))
-                grip_cmd = d_obj <= self.PICK_RADIUS
-        else:
-            grip_cmd = bool(float(np.clip(a[2], 0.0, 1.0)) > 0.5)
+        tau = np.clip(a[: self.N], -1.0, 1.0) * self.MAX_TORQUE
 
-        # Gripper transitions: open->closed near object attaches; closed->open releases.
-        if grip_cmd and not self.gripper_closed:
-            d_obj = float(torch.linalg.vector_norm(self.agent_pos - self.object_pos))
+        # Second-order joint dynamics: qdd = (tau - b*qd) / I. Euler integration.
+        qdd = (tau - self.JOINT_DAMPING * self.qd) / self.JOINT_INERTIA
+        self.qd = (self.qd + qdd * self.DT).astype(np.float32)
+        self.q = ((self.q + self.qd * self.DT + np.pi) % (2 * np.pi) - np.pi).astype(np.float32)
+
+        # Trail of past EE positions for rendering.
+        self._trail.append(torch.from_numpy(self.ee.copy()))
+        self.ee = self.fk(self.q)
+
+        # Auto-gripper: attach once EE is inside PICK_RADIUS of the object.
+        if not self.attached:
+            d_obj = float(np.linalg.norm(self.ee - self.object_pos.numpy()))
             if d_obj <= self.PICK_RADIUS:
                 self.attached = True
-                self.object_pos = self.agent_pos.clone()
-        elif self.gripper_closed and not grip_cmd:
-            self.attached = False
-        self.gripper_closed = grip_cmd
-
-        # Yaw integrates first; translation uses the new heading.
-        self.agent_yaw = float(
-            (self.agent_yaw + yaw_rate * self.DT + np.pi) % (2 * np.pi) - np.pi
-        )
-
-        total_mass = self.MASS + (self.OBJECT_MASS if self.attached else 0.0)
-        accel = thrust / total_mass
-        self.agent_speed = max((self.agent_speed + accel * self.DT) * self.LIN_DAMPING, 0.0)
-
-        heading = np.array(
-            [np.cos(self.agent_yaw), np.sin(self.agent_yaw)], dtype=np.float32
-        )
-        cur = self.agent_pos.detach().cpu().numpy()
-        # Push the pre-step position onto the trail before integrating.
-        self._trail.append(self.agent_pos.detach().clone())
-        nxt = cur + heading * self.agent_speed * self.DT
-        clipped = np.clip(nxt, 0.0, 1.0)
-        if not np.allclose(clipped, nxt):
-            # Damp speed on wall contact rather than zeroing it — at v=0 the min-turning-
-            # radius cap (ω≤v/R_MIN) deadlocks the agent against the wall.
-            self.agent_speed *= 0.5
-        self.agent_pos = torch.tensor(clipped, dtype=self.dtype)
-
         if self.attached:
-            self.object_pos = self.agent_pos.clone()
+            self.object_pos = torch.from_numpy(self.ee.copy()).float()
 
-        # Goal-dwell termination: count consecutive steps with object inside the goal.
-        d_goal = float(torch.linalg.vector_norm(self.object_pos - self.goal_pos))
+        # Goal-dwell termination.
+        d_goal = float(np.linalg.norm(self.object_pos.numpy() - self.goal_pos.numpy()))
         if d_goal <= self.DROP_RADIUS:
             self.dwell_counter += 1
         else:
@@ -225,243 +212,172 @@ class PickAndPlaceEnv(gym.Env):
         if self.dwell_counter >= self.GOAL_DWELL_STEPS:
             self.delivered = True
 
-        # Shaped reward.
-        if not self.attached:
-            d_obj = float(torch.linalg.vector_norm(self.agent_pos - self.object_pos))
-            reward = -d_obj
-        else:
-            reward = -d_goal + 1.0
-        if self.dwell_counter > 0:
-            reward += 0.5
-        if self.delivered:
-            reward += 10.0
-
-        self.steps += 1
         terminated = bool(self.delivered)
-        truncated = bool(self.steps >= self.MAX_EPISODE_STEPS)
+        self.steps += 1
+        truncated = self.steps >= self.MAX_EPISODE_STEPS
 
         if self._record:
             self._frames.append(self.current_frame())
 
-        return self._get_obs(), float(reward), terminated, truncated, self._get_info()
+        # 0 reward — we score on info["delivered"].
+        return self._get_obs(), 0.0, terminated, truncated, self._get_info()
 
-    def render(self):
-        if self.render_mode == "rgb_array":
-            return self.current_frame().detach().cpu().numpy()
-        return None
+    def _get_obs(self):
+        thetas = np.cumsum(self.q)
+        ee_yaw = float(thetas[-1])
+        return np.concatenate([
+            self.ee,
+            np.array([np.cos(ee_yaw), np.sin(ee_yaw)], dtype=np.float32),
+            self.q,
+            self.qd,
+            self.object_pos.numpy(),
+            self.goal_pos.numpy(),
+            np.array([1.0 if self.attached else 0.0], dtype=np.float32),
+        ]).astype(np.float32)
 
-    def close(self):
-        self._frames = []
-
-    # ---- observation / info ----
-    def _get_obs(self) -> np.ndarray:
-        ap = self.agent_pos.detach().cpu().numpy()
-        op = self.object_pos.detach().cpu().numpy()
-        gp = self.goal_pos.detach().cpu().numpy()
-        return np.array(
-            [
-                ap[0], ap[1],
-                float(np.cos(self.agent_yaw)), float(np.sin(self.agent_yaw)),
-                op[0], op[1],
-                gp[0], gp[1],
-                1.0 if self.attached else 0.0,
-            ],
-            dtype=np.float32,
-        )
-
-    def _get_info(self) -> dict:
+    def _get_info(self):
         return {
-            "attached": bool(self.attached),
-            "gripper_closed": bool(self.gripper_closed),
             "delivered": bool(self.delivered),
-            "dwell": int(self.dwell_counter),
             "steps": int(self.steps),
-            "yaw": float(self.agent_yaw),
-            "speed": float(self.agent_speed),
+            "attached": bool(self.attached),
+            "ee_pos": self.ee.tolist(),
         }
+
+    # ---- backwards-compat properties for external callers (eval_bc.track etc.) ----
+    @property
+    def agent_pos(self):
+        # The "agent" for the policy is the EE.
+        return torch.from_numpy(self.ee.copy())
+
+    @property
+    def agent_yaw(self):
+        thetas = np.cumsum(self.q)
+        return float(thetas[-1])
+
+    @property
+    def agent_speed(self):
+        # Cartesian EE speed magnitude.
+        J = self.jacobian(self.q)
+        v = J @ self.qd
+        return float(np.linalg.norm(v))
 
     # ---- rendering ----
+    def _seg_distance(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+        """Per-pixel distance from each grid point to the segment a→b."""
+        ax, ay = float(a[0]), float(a[1])
+        bx, by = float(b[0]), float(b[1])
+        vx, vy = bx - ax, by - ay
+        vv = max(vx * vx + vy * vy, 1e-9)
+        px = self.grid_x - ax
+        py = self.grid_y - ay
+        t = ((px * vx + py * vy) / vv).clamp(0.0, 1.0)
+        proj_x = ax + t * vx
+        proj_y = ay + t * vy
+        return torch.sqrt((self.grid_x - proj_x) ** 2 + (self.grid_y - proj_y) ** 2)
+
     def current_frame(self) -> torch.Tensor:
-        frame = self._bg.view(1, 1, 3).expand(self.H, self.W, 3).clone()
+        """RGB image of the current arm + object + goal, shape (H, W, 3) uint8."""
+        frame = self._bg.unsqueeze(0).unsqueeze(0).expand(self.H, self.W, 3).clone()
 
-        # Goal: hollow circle (annulus).
-        gx = float(self.goal_pos[0]); gy = float(self.goal_pos[1])
+        # Goal annulus
+        gx, gy = float(self.goal_pos[0]), float(self.goal_pos[1])
         gd2 = (self.grid_x - gx) ** 2 + (self.grid_y - gy) ** 2
         gr_outer = self.GOAL_RADIUS
-        gr_inner = max(0.0, gr_outer - self.GOAL_OUTLINE)
+        gr_inner = max(self.GOAL_RADIUS - self.GOAL_OUTLINE, 0.0)
         goal_mask = (gd2 <= gr_outer ** 2) & (gd2 >= gr_inner ** 2)
         frame[goal_mask] = self._goal_c
 
-        # Agent trail: oldest -> newest, with linearly increasing opacity.
-        ar = self.AGENT_RADIUS
-        n_trail = len(self._trail)
-        if n_trail > 0:
-            for i, pos in enumerate(self._trail):
-                # i = 0 is oldest; opacity grows toward the present.
-                alpha = (i + 1) / (n_trail + 1)
-                px = float(pos[0]); py = float(pos[1])
-                tmask = (self.grid_x - px) ** 2 + (self.grid_y - py) ** 2 <= ar ** 2
-                frame[tmask] = self._agent_c * alpha + frame[tmask] * (1.0 - alpha)
+        # Arm links
+        joints = self.joint_positions(self.q)
+        for i in range(self.N):
+            a = torch.tensor(joints[i], dtype=torch.float32)
+            b = torch.tensor(joints[i + 1], dtype=torch.float32)
+            mask = self._seg_distance(a, b) <= self.LINK_WIDTH
+            frame[mask] = self._arm_c
 
-        # Object: filled circle.
-        ox = float(self.object_pos[0]); oy = float(self.object_pos[1])
-        or_ = self.OBJECT_RADIUS
-        obj_mask = (self.grid_x - ox) ** 2 + (self.grid_y - oy) ** 2 <= or_ ** 2
-        frame[obj_mask] = self._obj_c
+        # Joint pivots (incl. base)
+        for j in joints:
+            d2 = (self.grid_x - float(j[0])) ** 2 + (self.grid_y - float(j[1])) ** 2
+            frame[d2 <= self.JOINT_RADIUS ** 2] = self._joint_c
 
-        # Agent: filled circle (current pose, fully opaque on top of the trail).
-        ax = float(self.agent_pos[0]); ay = float(self.agent_pos[1])
-        agent_mask = (self.grid_x - ax) ** 2 + (self.grid_y - ay) ** 2 <= ar ** 2
-        frame[agent_mask] = self._agent_c
+        # Object
+        ox, oy = float(self.object_pos[0]), float(self.object_pos[1])
+        od2 = (self.grid_x - ox) ** 2 + (self.grid_y - oy) ** 2
+        frame[od2 <= self.OBJECT_RADIUS ** 2] = self._obj_c
 
-        # Gripper-closed indicator: small white inner dot.
-        if self.gripper_closed:
-            inner_r = ar * 0.45
-            inner_mask = (self.grid_x - ax) ** 2 + (self.grid_y - ay) ** 2 <= inner_r ** 2
-            frame[inner_mask] = self._grip_c
+        return (frame * 1.0).to(torch.uint8) if frame.dtype != torch.uint8 else frame
 
-        # Yaw indicator: black arrow (thick shaft + triangular head) along heading.
-        cy = float(np.cos(self.agent_yaw))
-        sy = float(np.sin(self.agent_yaw))
-        u = (self.grid_x - ax) * cy + (self.grid_y - ay) * sy
-        v = -(self.grid_x - ax) * sy + (self.grid_y - ay) * cy
-        shaft_len = ar * 2.4
-        head_len = ar * 1.25
-        shaft_thick = ar * 0.4
-        head_base = ar * 1.0
-        shaft_mask = (u >= 0) & (u <= shaft_len) & (v.abs() <= shaft_thick)
-        # Triangular head from u in [shaft_len, shaft_len + head_len], tapering to a tip.
-        head_u = u - shaft_len
-        head_mask = (
-            (head_u >= 0)
-            & (head_u <= head_len)
-            & (v.abs() <= head_base * (1.0 - head_u / head_len))
-        )
-        frame[shaft_mask | head_mask] = self._yaw_c
+    def render_overlay(self, poses, object_pos=None, goal_pos=None, colors=None) -> torch.Tensor:
+        """Render a static background (object + goal) with a colored EE-trajectory
+        polyline overlaid. `poses` is a sequence of (x, y, yaw) tuples; we ignore yaw
+        and just dot the EE positions.
 
-        # Planned-path overlay (debug): black dot + short arrow at each future waypoint.
-        pp = self.planned_path
-        if pp is not None and len(pp) > 0:
-            pp = np.asarray(pp, dtype=np.float32)
-            has_yaw = pp.ndim == 2 and pp.shape[1] >= 3
-            dot_r = ar * 0.35
-            pp_shaft_len = ar * 1.0
-            pp_shaft_thick = ar * 0.12
-            for i in range(len(pp)):
-                px = float(pp[i, 0]); py = float(pp[i, 1])
-                dot_mask = (self.grid_x - px) ** 2 + (self.grid_y - py) ** 2 <= dot_r ** 2
-                frame[dot_mask] = self._yaw_c
-                if has_yaw:
-                    yaw_i = float(pp[i, 2])
-                elif i + 1 < len(pp):
-                    dx = float(pp[i + 1, 0] - px); dy = float(pp[i + 1, 1] - py)
-                    if dx * dx + dy * dy < 1e-12:
-                        continue
-                    yaw_i = float(np.arctan2(dy, dx))
-                else:
-                    continue
-                cyi = float(np.cos(yaw_i)); syi = float(np.sin(yaw_i))
-                pu = (self.grid_x - px) * cyi + (self.grid_y - py) * syi
-                pv = -(self.grid_x - px) * syi + (self.grid_y - py) * cyi
-                pp_mask = (pu >= 0) & (pu <= pp_shaft_len) & (pv.abs() <= pp_shaft_thick)
-                frame[pp_mask] = self._yaw_c
-
-        return frame.clamp(0, 255).to(torch.uint8)
-
-    def render_overlay(self, poses, object_pos=None, goal_pos=None,
-                       colors=None, alpha: float = 0.55) -> torch.Tensor:
-        """Render a single frame with every (x, y[, yaw]) pose in `poses` superimposed.
         Object/goal default to the env's current state; pass overrides to pin them
-        (e.g., the episode's *starting* object_pos, since it follows the agent once
-        attached). `colors` is an optional (N, 3) RGB-in-[0,255] array — pass one
-        normalized against the same scale (e.g. MAX_EPISODE_STEPS) across rollouts
-        if you want time-color to be comparable. Defaults to AGENT_COLOR."""
-        frame = self._bg.view(1, 1, 3).expand(self.H, self.W, 3).clone()
+        across episodes. `colors` is an optional (T, 3) float array in [0, 255] for
+        per-pose dots (e.g. time-coloring with viridis)."""
+        frame = self._bg.unsqueeze(0).unsqueeze(0).expand(self.H, self.W, 3).clone().float()
 
-        gp = self.goal_pos if goal_pos is None else goal_pos
-        gx = float(gp[0]); gy = float(gp[1])
+        gp = self.goal_pos if goal_pos is None else (goal_pos.detach().cpu().numpy()
+                                                    if isinstance(goal_pos, torch.Tensor) else goal_pos)
+        op = self.object_pos if object_pos is None else (object_pos.detach().cpu().numpy()
+                                                        if isinstance(object_pos, torch.Tensor) else object_pos)
+        gx, gy = float(gp[0]), float(gp[1])
         gd2 = (self.grid_x - gx) ** 2 + (self.grid_y - gy) ** 2
         gr_outer = self.GOAL_RADIUS
-        gr_inner = max(0.0, gr_outer - self.GOAL_OUTLINE)
+        gr_inner = max(self.GOAL_RADIUS - self.GOAL_OUTLINE, 0.0)
         goal_mask = (gd2 <= gr_outer ** 2) & (gd2 >= gr_inner ** 2)
         frame[goal_mask] = self._goal_c
 
-        op = self.object_pos if object_pos is None else object_pos
-        ox = float(op[0]); oy = float(op[1])
-        or_ = self.OBJECT_RADIUS
-        obj_mask = (self.grid_x - ox) ** 2 + (self.grid_y - oy) ** 2 <= or_ ** 2
-        frame[obj_mask] = self._obj_c
+        ox, oy = float(op[0]), float(op[1])
+        od2 = (self.grid_x - ox) ** 2 + (self.grid_y - oy) ** 2
+        frame[od2 <= self.OBJECT_RADIUS ** 2] = self._obj_c
 
-        ar = self.AGENT_RADIUS
-        poses = np.asarray(poses, dtype=np.float32)
-        if poses.ndim == 1:
-            poses = poses.reshape(-1, 2)
-        N = len(poses)
-        if colors is not None:
-            colors = np.asarray(colors, dtype=np.float32).reshape(N, 3)
-        for i in range(N):
-            ax, ay = float(poses[i, 0]), float(poses[i, 1])
-            c = torch.from_numpy(colors[i]) if colors is not None else self._agent_c
-            d2 = (self.grid_x - ax) ** 2 + (self.grid_y - ay) ** 2
-            am = d2 <= ar ** 2
-            frame[am] = c * alpha + frame[am] * (1.0 - alpha)
+        # Base marker
+        bx, by = float(self.base_pos[0]), float(self.base_pos[1])
+        bd2 = (self.grid_x - bx) ** 2 + (self.grid_y - by) ** 2
+        frame[bd2 <= self.JOINT_RADIUS ** 2] = self._joint_c
 
-        return frame.clamp(0, 255).to(torch.uint8)
+        # EE trail
+        dot_r = 0.006
+        for i, p in enumerate(poses):
+            px = float(p[0]); py = float(p[1])
+            d2 = (self.grid_x - px) ** 2 + (self.grid_y - py) ** 2
+            mask = d2 <= dot_r ** 2
+            if colors is not None and i < len(colors):
+                c = torch.tensor(colors[i], dtype=torch.float32)
+            else:
+                c = self._arm_c
+            frame[mask] = c
 
-    # ---- video / state helpers ----
-    def save_video(self, path: str):
-        fps = max(1, int(round(1.0 / self.DT)))
-        assert len(self._frames) > 0, "No frames recorded. Set env._record = True before reset()."
-        frames = torch.stack(self._frames, dim=0).to(torch.uint8).cpu().numpy()
-        T, H, W, _ = frames.shape
+        return frame.to(torch.uint8)
 
-        ffmpeg = shutil.which("ffmpeg")
-        if ffmpeg is None:
-            raise RuntimeError(
-                "save_video requires the `ffmpeg` binary on PATH (e.g. `apt install ffmpeg`)."
-            )
-        cmd = [
-            ffmpeg, "-y", "-loglevel", "error",
-            "-f", "rawvideo", "-pix_fmt", "rgb24",
-            "-s", f"{W}x{H}", "-r", str(fps),
-            "-i", "-",
-            "-an",
-            "-vcodec", "libx264", "-pix_fmt", "yuv420p",
-            path,
-        ]
-        proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
-        _, err = proc.communicate(frames.tobytes())
-        if proc.returncode != 0:
-            raise RuntimeError(f"ffmpeg failed (rc={proc.returncode}): {err.decode(errors='replace')}")
+    def save_video(self, path: str, fps: Optional[int] = None) -> None:
+        if not self._frames:
+            return
+        fps = max(1, int(round(1.0 / self.DT))) if fps is None else int(fps)
+        out_dir = os.path.dirname(path)
+        if out_dir:
+            os.makedirs(out_dir, exist_ok=True)
+        # Lazy: write frames as PNGs and use ffmpeg if available, else just save first frame.
+        from tempfile import TemporaryDirectory
+        with TemporaryDirectory() as tmp:
+            for i, f in enumerate(self._frames):
+                arr = f.cpu().numpy() if hasattr(f, "cpu") else np.asarray(f)
+                import matplotlib.pyplot as plt
+                plt.imsave(os.path.join(tmp, f"f_{i:05d}.png"), arr)
+            ffmpeg = shutil.which("ffmpeg")
+            if ffmpeg is None:
+                # Just keep the last frame as a still image.
+                last = self._frames[-1].cpu().numpy() if hasattr(self._frames[-1], "cpu") else np.asarray(self._frames[-1])
+                import matplotlib.pyplot as plt
+                plt.imsave(path.replace(".mp4", ".png"), last)
+                return
+            subprocess.run([
+                ffmpeg, "-y", "-framerate", str(fps),
+                "-i", os.path.join(tmp, "f_%05d.png"),
+                "-c:v", "libx264", "-pix_fmt", "yuv420p", path,
+            ], check=False, capture_output=True)
 
-        sidecar_path = os.path.splitext(path)[0] + ".json"
-        with open(sidecar_path, "w", encoding="utf-8") as fh:
-            json.dump({"video_path": path, "fps": int(fps)}, fh, indent=2)
 
-        self._frames = []
-
-    def get_env_state(self) -> dict:
-        return {
-            "agent_pos": self.agent_pos.detach().cpu().clone(),
-            "agent_yaw": float(self.agent_yaw),
-            "agent_speed": float(self.agent_speed),
-            "object_pos": self.object_pos.detach().cpu().clone(),
-            "goal_pos": self.goal_pos.detach().cpu().clone(),
-            "attached": bool(self.attached),
-            "gripper_closed": bool(self.gripper_closed),
-            "dwell_counter": int(self.dwell_counter),
-            "delivered": bool(self.delivered),
-            "steps": int(self.steps),
-        }
-
-    def set_env_state(self, s: dict):
-        self.agent_pos = s["agent_pos"].to(dtype=self.dtype)
-        self.agent_yaw = float(s["agent_yaw"])
-        self.agent_speed = float(s["agent_speed"])
-        self.object_pos = s["object_pos"].to(dtype=self.dtype)
-        self.goal_pos = s["goal_pos"].to(dtype=self.dtype)
-        self.attached = bool(s["attached"])
-        self.gripper_closed = bool(s["gripper_closed"])
-        self.dwell_counter = int(s["dwell_counter"])
-        self.delivered = bool(s["delivered"])
-        self.steps = int(s["steps"])
+# Keep the old import name available so existing code keeps working.
+PickAndPlaceEnv = PlanarArmEnv

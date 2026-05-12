@@ -3,12 +3,12 @@ import os
 
 import numpy as np
 
-from env import PickAndPlaceEnv
+from env import PlanarArmEnv
 from expert import ExpertController
 
 
-def collect(num_episodes: int, seed: int):
-    env = PickAndPlaceEnv()
+def collect(num_episodes: int, seed: int, n_joints: int):
+    env = PlanarArmEnv(n_joints=n_joints)
     ctrl = ExpertController()
 
     obs_buf, act_buf, ep_buf = [], [], []
@@ -16,13 +16,13 @@ def collect(num_episodes: int, seed: int):
 
     for ep in range(num_episodes):
         if ep % 100 == 0:
-            print(f"collected [{ep}] episodess")
+            print(f"collected [{ep}] episodes")
         obs, info = env.reset(seed=seed + ep)
         terminated = truncated = False
         while not (terminated or truncated):
             a = ctrl.act(env)
             obs_buf.append(obs)
-            act_buf.append(a[:2])
+            act_buf.append(a)
             ep_buf.append(ep)
             obs, _r, terminated, truncated, info = env.step(a)
         successes += int(info["delivered"])
@@ -40,11 +40,11 @@ def main():
     p.add_argument("--out", type=str, default="dataset.npz")
     p.add_argument("--episodes", type=int, default=100)
     p.add_argument("--seed", type=int, default=0)
-    
+    p.add_argument("--n_joints", type=int, default=3)
     args = p.parse_args()
 
     obs, act, ep, successes = collect(
-        int(args.episodes), int(args.seed)
+        int(args.episodes), int(args.seed), int(args.n_joints)
     )
 
     out_dir = os.path.dirname(args.out)

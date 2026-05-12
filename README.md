@@ -1,21 +1,22 @@
 # bcae
 
-Behavior cloning with action-space autoencoders, on a 2D pick-and-place env with nonholonomic dynamics. Tests whether pretraining an autoencoder on 16-step (Δx, Δy) action chunks and supervising the BC policy on the latent beats predicting the raw chunk.
+Behavior cloning with action-space autoencoders, on a 2D pick-and-place env. Tests whether pretraining an autoencoder on action chunks of the end-effector trajectory and supervising the BC policy on the latent beats predicting the raw chunk.
 
 ## Env
 
-- Unicycle agent with no reverse (`agent_speed ≥ 0`) and a minimum turning radius (`|ω| ≤ |v| / R_MIN`). The feasible trajectory set becomes Dubins-like (smooth, forward-only).
-- 2D arena, pick an object, deliver it inside a goal radius for a few consecutive steps.
-- Scripted expert (`expert.py`) hits 100% with two geometric heuristics: opposite-loop escape when the target is inside the natural turn circle, and a wall-trap escape that aims at the arena center when wedged against a wall.
+- Planar N-link revolute arm (default N=3), no gravity. Base at the arena center, total reach 1.0, joint inertia + light damping. Action = per-joint torque in `[-1, 1]`.
+- Pick an object with the EE and deliver it inside a goal radius for a few consecutive steps.
+- Configurable: `PlanarArmEnv(n_joints=N)`. Obs is `[ee_x, ee_y, cos θ_N, sin θ_N, q, qd, object, goal, attached]` (`2N + 9` dims).
+- Scripted expert: operational-space PD on the EE via the transpose Jacobian (`τ = Jᵀ·F_des − K_Q·qd`). 95–100% across N ∈ {2, 3, 4}.
 
 ## Pipeline
 
 1. **Collect** demos with the scripted expert → `dataset.npz` (`obs`, `act`, `episode`).
-2. **Pretrain AE** on 16-step (Δx, Δy) windows of the demos. `--beta 0` = deterministic AE; `> 0` = VAE.
+2. **Pretrain AE** on L-step (Δx, Δy) EE-trajectory windows. `--beta 0` = deterministic AE; `> 0` = VAE.
 3. **Train BC**:
-   - *delta*: MLP(obs-history) → flat 32-d chunk.
+   - *delta*: MLP(obs-history) → flat 2L-d chunk of EE deltas.
    - *latent*: MLP(obs-history) → z, supervised on the frozen AE encoder's μ (no backprop through the decoder). At rollout, the frozen decoder turns z back into the chunk.
-4. **Rollout**: feedback-linearization tracker (`eval_bc.track`) converts the chunk to (thrust, yaw); re-plan every `--execute` env steps.
+4. **Rollout**: operational-space tracker (`eval_bc.track`) follows the predicted EE waypoints by computing `F_des = K_P·(p_ref − ee) + K_D·(v_ref − ee_vel)` and mapping it to joint torques via `τ = Jᵀ·F_des − K_Q·qd`. Re-plan every `--execute` env steps (default = `max(8, window·3/4)`).
 
 ## Layout
 
