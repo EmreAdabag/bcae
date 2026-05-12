@@ -12,6 +12,12 @@ from concurrent.futures import ThreadPoolExecutor
 import matplotlib.pyplot as plt
 import numpy as np
 
+# Sibling entry-point scripts live at the repo root, one level up.
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+TRAIN_BC = os.path.join(REPO_ROOT, "train_bc.py")
+TRAIN_VAE = os.path.join(REPO_ROOT, "train_vae.py")
+EVAL_BC = os.path.join(REPO_ROOT, "eval_bc.py")
+
 ARCHS = [("mlp", None), ("dec_z4", 4), ("dec_z8", 8), ("dec_z16", 16)]
 DEMO_COUNTS = [25, 50, 100, 250, 500, 1000]
 
@@ -64,7 +70,7 @@ def train_vaes(args, archs):
                 print(f"[vae] reusing {path}")
                 continue
             cmd = [
-                sys.executable, "train_vae.py",
+                sys.executable, TRAIN_VAE,
                 "--out", path,
                 "--latent_dim", str(z),
                 "--window", str(args.window),
@@ -96,7 +102,7 @@ def train_bcs(args, archs):
                     print(f"[bc] reusing {ckpt}")
                     continue
                 cmd = [
-                    sys.executable, "train_bc.py",
+                    sys.executable, TRAIN_BC,
                     "--out", ckpt,
                     "--log_csv", os.path.join(args.out_dir, f"bc_{tag}.csv"),
                     "--max_episodes", str(demos),
@@ -141,7 +147,7 @@ def eval_all(args, archs):
         try:
             env = os.environ.copy()
             env["CUDA_VISIBLE_DEVICES"] = str(gpu)
-            cmd = [sys.executable, "eval_bc.py", "--ckpt", ckpt, "--episodes", str(args.eval_episodes_final)]
+            cmd = [sys.executable, EVAL_BC, "--ckpt", ckpt, "--episodes", str(args.eval_episodes_final)]
             r = subprocess.run(cmd, capture_output=True, text=True, env=env)
             if r.returncode != 0:
                 print(f"!! [gpu{gpu}] eval FAILED {ckpt} rc={r.returncode}", flush=True)

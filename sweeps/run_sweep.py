@@ -7,6 +7,11 @@ import sys
 import matplotlib.pyplot as plt
 import numpy as np
 
+# Sibling entry-point scripts live at the repo root, one level up.
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+TRAIN_BC = os.path.join(REPO_ROOT, "train_bc.py")
+TRAIN_VAE = os.path.join(REPO_ROOT, "train_vae.py")
+
 
 # (arch_name, latent_dim or None for the no-VAE baseline)
 ARCHS = [
@@ -42,7 +47,7 @@ def ensure_vae(z, out_dir, args):
         print(f"[vae] reusing {path}")
         return path
     cmd = [
-        sys.executable, "train_vae.py",
+        sys.executable, TRAIN_VAE,
         "--out", path,
         "--latent_dim", str(z),
         "--window", str(args.window),
@@ -60,7 +65,7 @@ def run_one(arch_name, vae_path, demos, args, out_dir):
     log_path = os.path.join(out_dir, f"bc_{tag}.csv")
     viz_dir = os.path.join(out_dir, f"viz_{tag}")
     cmd = [
-        sys.executable, "train_bc.py",
+        sys.executable, TRAIN_BC,
         "--out", ckpt_path,
         "--log_csv", log_path,
         "--max_episodes", str(demos),

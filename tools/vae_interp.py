@@ -1,11 +1,14 @@
 import argparse
 import os
+import sys
 
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
 from matplotlib.gridspec import GridSpec, GridSpecFromSubplotSpec
 
+# Repo root holds the importable modules (env.py, train_vae.py, etc.).
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from train_vae import VAE
 
 

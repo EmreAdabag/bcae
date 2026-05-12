@@ -24,7 +24,8 @@ def main():
 
     rows = []
     for ckpt in args.ckpts:
-        cmd = [sys.executable, "eval_bc.py", "--ckpt", ckpt, "--episodes", str(args.episodes)]
+        cmd = [sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), "eval_bc.py"),
+               "--ckpt", ckpt, "--episodes", str(args.episodes)]
         print(f"=== {ckpt} ===", flush=True)
         r = subprocess.run(cmd, capture_output=True, text=True)
         if r.returncode != 0:

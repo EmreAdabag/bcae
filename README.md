@@ -17,22 +17,28 @@ Behavior cloning with action-space autoencoders, on a 2D pick-and-place env with
    - *latent*: MLP(obs-history) → z, supervised on the frozen AE encoder's μ (no backprop through the decoder). At rollout, the frozen decoder turns z back into the chunk.
 4. **Rollout**: feedback-linearization tracker (`eval_bc.track`) converts the chunk to (thrust, yaw); re-plan every `--execute` env steps.
 
-## Files
+## Layout
 
-| | |
-|---|---|
-| `env.py`, `expert.py` | sim + scripted expert |
-| `collect_data.py` | write `dataset.npz` |
-| `train_vae.py` | AE/VAE on action chunks |
-| `train_bc.py` | BC MLP; `--vae_ckpt` enables latent mode |
-| `eval_bc.py` | eval one ckpt (success rate, optional video/viz) |
-| `eval_many.py` | eval many ckpts → CSV |
-| `run_sweep.py` | 4-arch × 6-demo-count β-ablation sweep (single seed) |
-| `multi_seed_sweep.py` | multi-seed sweep with 2-GPU parallel training + parallel eval. Supports `--fixed_vae` to isolate BC-seed variance. |
-| `plot_eval.py` | success vs demos, Wilson 95% CIs |
-| `plot_seeds.py` | seed variability (mean ± seed σ + per-seed scatter) |
-| `plot_compare.py` | overlay multiple eval CSVs (one panel per arch) |
-| `vae_interp.py`, `plot_demos.py`, `visualize_dataset.py` | exploration / viz helpers |
+```
+bcae/
+├── env.py, expert.py            sim + scripted expert
+├── collect_data.py              write dataset.npz
+├── train_vae.py                 AE/VAE on action chunks
+├── train_bc.py                  BC MLP; --vae_ckpt enables latent mode
+├── eval_bc.py                   eval one ckpt (success rate, optional video/viz)
+├── eval_many.py                 eval many ckpts → CSV
+├── sweeps/
+│   ├── run_sweep.py             4-arch × 6-demo-count β-ablation sweep
+│   └── multi_seed_sweep.py      multi-seed sweep, 2-GPU parallel train + eval; --fixed_vae isolates BC-seed variance
+├── plots/
+│   ├── plot_eval.py             success vs demos, Wilson 95% CIs
+│   ├── plot_seeds.py            seed variability (mean ± seed σ + per-seed scatter)
+│   └── plot_compare.py          overlay multiple eval CSVs (one panel per arch)
+└── tools/
+    ├── vae_interp.py            VAE latent interpolation viz
+    ├── plot_demos.py            ground-truth demo windows viz
+    └── visualize_dataset.py     dataset scatter / overview
+```
 
 ## Setup
 
@@ -48,29 +54,29 @@ conda activate bcae
 python collect_data.py --episodes 1000
 
 # Single-seed sweep at chosen β (4 archs × 6 demo counts)
-python run_sweep.py --out_dir sweep         --beta 0.0
-python run_sweep.py --out_dir sweep_beta1e3 --beta 1e-3 --wandb_suffix=-beta1e3
-python run_sweep.py --out_dir sweep_beta1   --beta 1.0  --wandb_suffix=-beta1
+python sweeps/run_sweep.py --out_dir sweep         --beta 0.0
+python sweeps/run_sweep.py --out_dir sweep_beta1e3 --beta 1e-3 --wandb_suffix=-beta1e3
+python sweeps/run_sweep.py --out_dir sweep_beta1   --beta 1.0  --wandb_suffix=-beta1
 
 # Multi-seed sweep (β=0, 5 seeds, parallel across both GPUs)
-python multi_seed_sweep.py --out_dir sweep_multi --seeds 0 1 2 3 4 --demos 25 100 500
+python sweeps/multi_seed_sweep.py --out_dir sweep_multi --seeds 0 1 2 3 4 --demos 25 100 500
 
 # Same, but isolate BC-seed variance with one fixed VAE
-python multi_seed_sweep.py --out_dir sweep_bc_only --archs dec_z8 --seeds 0 1 2 3 4 5 6 7 8 9 \
+python sweeps/multi_seed_sweep.py --out_dir sweep_bc_only --archs dec_z8 --seeds 0 1 2 3 4 5 6 7 8 9 \
   --fixed_vae sweep_multi/vae_z8_s0.pt
 
 # Post-hoc eval + plot
 python eval_many.py --ckpts sweep/bc_*.pt --episodes 1000 --out_csv sweep/eval_1000.csv
-python plot_eval.py --csv sweep/eval_1000.csv --title_suffix " — β=0"
+python plots/plot_eval.py --csv sweep/eval_1000.csv --title_suffix " — β=0"
 
 # Overlay β values
-python plot_compare.py \
+python plots/plot_compare.py \
   --csvs   sweep/eval_1000.csv sweep_beta1e3/eval_1000.csv sweep_beta1/eval_1000.csv \
   --labels "β=0"               "β=1e-3"                    "β=1" \
   --out compare_betas.png
 
 # Seed plot (from multi-seed CSV)
-python plot_seeds.py --csv sweep_multi/eval_100.csv
+python plots/plot_seeds.py --csv sweep_multi/eval_100.csv
 ```
 
 ## Notes

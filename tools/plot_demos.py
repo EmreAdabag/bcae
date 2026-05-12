@@ -1,10 +1,14 @@
 import argparse
 import os
+import sys
 
 import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.gridspec import GridSpec, GridSpecFromSubplotSpec
 
+# Repo root holds env.py and train_vae.py; tools/ holds vae_interp.py.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from env import PickAndPlaceEnv
 from vae_interp import rollout
 from train_vae import make_windows
